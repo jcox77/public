@@ -1,0 +1,358 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Threading.Tasks;
+using Azure;
+using Azure.Data.Tables;
+using Azure.Messaging.EventHubs;
+using Azure.Messaging.EventHubs.Producer;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs;
+//using Microsoft.Azure.WebJobs.Host;
+//using Microsoft.Azure.WebJobs.Host.Bindings;
+//using Microsoft.Azure.WebJobs.Extensions.Storage;
+//using Azure.WebJobs.Extensions.Storage.Bindings;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Microsoft.WindowsAzure.Storage;
+using Newtonsoft.Json;
+using System.Data.Entity.Core.EntityClient;
+using System.Net.Http;
+using System.Net.Http.Headers;
+
+
+namespace MyFunctions
+{
+    public class BearerToken
+    {
+        [JsonProperty("data")]
+        public Data BearerData { get; set; }
+
+        [JsonProperty("meta")]
+        public Meta BearerMeta { get; set; }
+
+        public class Data
+        {
+            [JsonProperty("access_token")]
+            public string AccessToken { get; set; }
+
+            [JsonProperty("expires_in")]
+            public int ExpiresIn { get; set; }
+
+            [JsonProperty("token_type")]
+            public string TokenType { get; set; }
+
+            [JsonProperty("scope")]
+            public string Scope { get; set; }
+        }
+        public class Meta
+        {
+            [JsonProperty("date_time")]
+            public string DateTime { get; set; }
+            [JsonProperty("name")]
+            public string Name { get; set; }
+            [JsonProperty("uuid")]
+            public string Uuid { get; set; }
+            [JsonProperty("start_timestamp")]
+            public long StartTimestamp { get; set; }
+            [JsonProperty("end_timestamp")]
+            public long EndTimestamp { get; set; }
+            [JsonProperty("execution_time")]
+            public long ExecutionTime { get; set; }
+        }
+    }
+
+    public class LocationData : Azure.Data.Tables.ITableEntity
+    {
+        public string Name { get; set; }
+        public double Latitude { get; set; }
+        public double Longitude { get; set; }
+
+        public string PartitionKey { get; set; }
+        public string RowKey { get; set; }
+        public DateTimeOffset? Timestamp { get; set; }
+        public ETag ETag { get; set; }
+    }
+
+    public class WeatherData
+    {
+        public string Json { get; set; }
+    }
+
+    public static class WeatherFunction
+    {
+        [FunctionName("WeatherFunction")]
+        public static async Task Run(
+            [TimerTrigger("0 50 * * * *")] TimerInfo myTimer,
+            [Table("WeatherStations", Connection = "AzureWebJobsStorage")] TableClient tableClient,
+            ILogger log)
+        {
+            log.LogInformation($"C# Timer trigger function executed at: {DateTime.Now}");
+            DateTime startOfProcessing = DateTime.UtcNow;
+            //DateTime startOfProcessing = new DateTime(currentTime.Year, currentTime.Month, currentTime.Day, currentTime.Hour, 5, 0, DateTimeKind.Utc);
+            var locationData = await ReadLocationDataFromTable(tableClient, log);
+            // Call function to make parallel API calls to get weather data for each location
+            log.LogInformation($"Number of locations read from table : {locationData.Count}");
+            string bearerToken = null;
+            var historicWeatherData = await GetWeatherData(locationData, "historic", bearerToken, log);
+            var forecastWeatherData = await GetWeatherData(locationData, "forecast", bearerToken, log);
+            // Call function to send weather data to Event Hub
+            log.LogInformation($"Number of historic API responses : {historicWeatherData.Count}");
+            log.LogInformation($"Number of forecast API responses : {forecastWeatherData.Count}");
+            await SendWeatherDataToEventHub(historicWeatherData, "historic", startOfProcessing, log);
+            await SendWeatherDataToEventHub(forecastWeatherData, "forecast", startOfProcessing, log);
+        }
+        public static async Task<string> GetBearerToken(string grantType, string clientId, string clientSecret, string audience)
+        {
+            using (var httpClient = new HttpClient())
+            {
+                string bearerTokenUrl = Environment.GetEnvironmentVariable("APIBearerTokenURI");
+                var request = new HttpRequestMessage
+                {
+                    RequestUri = new Uri(bearerTokenUrl),
+                    Method = HttpMethod.Post
+                };
+
+                var body = new Dictionary<string, string>
+    {
+        { "grant_type", grantType },
+        { "client_id", clientId },
+        { "client_secret", clientSecret },
+        { "audience", audience }
+    };
+
+                request.Content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json");
+
+                try
+                {
+                    var response = await httpClient.SendAsync(request);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        throw new Exception($"Failed to get bearer token: {response.ReasonPhrase}");
+                    }
+                    var json = await response.Content.ReadAsStringAsync();
+                    var token = JsonConvert.DeserializeObject<BearerToken>(json);
+                    var bearer_access_token = token.BearerData.AccessToken;
+                    return bearer_access_token;
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Failed to get bearer token", ex);
+                }
+            }
+
+        }
+        public static async Task<List<LocationData>> ReadLocationDataFromTable(TableClient tableClient, ILogger log)
+        {
+            log.LogInformation("Getting all weather lat longs");
+            var locationdata = tableClient.Query<LocationData>().Select(x => new LocationData
+            {
+                Name = x.Name,
+                Latitude = x.Latitude,
+                Longitude = x.Longitude
+            }).ToList();
+
+            return locationdata;
+        }
+        private static async Task<List<WeatherData>> GetWeatherData(List<LocationData> locationData, string WeatherType, string bearerToken, ILogger log)
+        {
+            string clientId = Environment.GetEnvironmentVariable("APIClientId");
+            string clientSecret = Environment.GetEnvironmentVariable("APIClientSecret");
+            string interval = Environment.GetEnvironmentVariable("APIInterval");
+            string units = Environment.GetEnvironmentVariable("APIUnits");
+            string parameters = Environment.GetEnvironmentVariable("APIParameters");
+            int APIRetries = int.Parse(Environment.GetEnvironmentVariable("APIRetries"));
+            int APIRetryPauseMSeconds = int.Parse(Environment.GetEnvironmentVariable("APIRetryPauseMSeconds"));
+
+            //string bearerToken = await GetBearerToken("client_credentials", clientId, clientSecret, "https://weather.api.dtn.com/conditions");
+            //log.LogInformation($"bearerToken: {bearerToken}");
+
+            if (bearerToken == null)
+            {
+                try
+                {
+                    bearerToken = await GetBearerToken("client_credentials", clientId, clientSecret, "https://weather.api.dtn.com/conditions");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("GetBearerToken failed: " + ex.Message);
+                    bearerToken = await GetBearerToken("client_credentials", clientId, clientSecret, "https://weather.api.dtn.com/conditions");
+                }
+            }
+
+
+            DateTime currentTime = DateTime.UtcNow;
+            DateTime startOfHour = new DateTime(currentTime.Year, currentTime.Month, currentTime.Day, currentTime.Hour, 0, 0, DateTimeKind.Utc);
+            DateTime endOfHour = startOfHour.AddHours(1);
+            string startOfHourToday = startOfHour.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            string endOfHourToday = endOfHour.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            string startOfHourTomorrow = startOfHour.AddDays(1).ToString("yyyy-MM-ddTHH:mm:ssZ");
+            string startOfHourIn7Days = startOfHour.AddDays(7).ToString("yyyy-MM-ddTHH:mm:ssZ");
+            string endOfHourTomorrow = endOfHour.AddDays(1).ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+            if (WeatherType == "historic")
+            {
+                var historicWeatherData = new List<WeatherData>();
+                foreach (var location in locationData)
+                {
+                    //bearerToken = null;  //simulate no token
+                    var locationWeather = await GetWeatherDataFromAPI(bearerToken, location, interval, units, parameters, startOfHourToday, startOfHourToday, APIRetries, APIRetryPauseMSeconds, log);
+                    //var locationWeatherTomorrow = await GetWeatherDataFromAPI(bearerToken, location, interval, units, parameters, startOfHourTomorrow, endOfHourTomorrow, log);
+                    historicWeatherData.Add(locationWeather);
+                    //weatherData.Add(locationWeatherTomorrow);
+                }
+                return historicWeatherData;
+            }
+            else if (WeatherType == "forecast")
+            {
+                var forecastWeatherData = new List<WeatherData>();
+                foreach (var location in locationData)
+                {
+                    var locationWeather = await GetWeatherDataFromAPI(bearerToken, location, interval, units, parameters, startOfHourTomorrow, startOfHourIn7Days, APIRetries, APIRetryPauseMSeconds, log);
+                    forecastWeatherData.Add(locationWeather);
+                }
+                return forecastWeatherData;
+            }
+            else
+            {
+                log.LogInformation($"This type of weather data is not available: {WeatherType}.  Only historic or forecast");
+                return null;
+            }
+            // var weatherData = new List<WeatherData>();
+            // foreach (var location in locationData)
+            // {
+            //     var locationWeather = await GetWeatherDataFromAPI(bearerToken, location, interval, units, parameters, startOfHourToday, endOfHourToday, log);
+            //     //var locationWeatherTomorrow = await GetWeatherDataFromAPI(bearerToken, location, interval, units, parameters, startOfHourTomorrow, endOfHourTomorrow, log);
+            //     weatherData.Add(locationWeather);
+            //     //weatherData.Add(locationWeatherTomorrow);
+            // }
+            // return weatherData;
+        }
+        private static async Task<WeatherData> GetWeatherDataFromAPI(string bearerToken, LocationData location, string Interval, string Units, string Parameters, string StartUTC, string EndUTC, int APIRetries, int APIRetryPauseMSeconds, ILogger log)
+        {
+            using (var httpClient = new HttpClient())
+            {
+                int retryCount = 0;
+                while (retryCount < APIRetries) // maximum number of retries
+                {
+                    try
+                    {
+                        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+                        var response = await httpClient.GetAsync($"https://weather.api.dtn.com/v1/conditions?interval={Interval}&lat={location.Latitude}&lon={location.Longitude}&parameters={Parameters}&startTime={StartUTC}&endTime={EndUTC}&units={Units}");
+                        //var response = await httpClient.GetAsync($"http://httpstat.us/503");
+                        response.EnsureSuccessStatusCode();    // Throw if not a success code.
+
+                        var weatherJson = await response.Content.ReadAsStringAsync();
+                        var weatherData = new WeatherData { Json = weatherJson };
+                        //log.LogInformation($"WeatherData.Json: {weatherData.Json}");
+                        return weatherData;
+                    }
+
+                    catch (HttpRequestException httpex)
+                    {
+                        if (httpex.StatusCode == HttpStatusCode.Unauthorized)
+                        {
+                            retryCount++;
+                            // Get a new bearer token
+                            string clientId = Environment.GetEnvironmentVariable("APIClientId");
+                            string clientSecret = Environment.GetEnvironmentVariable("APIClientSecret");
+                            bearerToken = await GetBearerToken("client_credentials", clientId, clientSecret, "https://weather.api.dtn.com/conditions");
+                            
+                            // Retry the API call with the new token
+                            continue;
+                        }
+                        else if ((int)httpex.StatusCode >= 400 && (int)httpex.StatusCode < 500)
+                        {
+                            retryCount++;
+                            // Log the error and retry count
+                            log.LogWarning($"Client error sending request to the API. HTTP {httpex.StatusCode}. Retrying in {APIRetryPauseMSeconds / 1000} seconds. Attempt {retryCount}/{APIRetries}");
+                            // Wait before retrying
+                            await Task.Delay(APIRetryPauseMSeconds);
+                            // Retry the API call
+                            continue;
+                        }
+                        else if ((int)httpex.StatusCode >= 500 && (int)httpex.StatusCode < 600)
+                        {
+                            retryCount++;
+                            // Log the error and retry count
+                            log.LogWarning($"Server error sending request to the API. HTTP {httpex.StatusCode}. Retrying in {APIRetryPauseMSeconds / 1000} seconds. Attempt {retryCount}/{APIRetries}");
+                            // Wait before retrying
+                            await Task.Delay(APIRetryPauseMSeconds);
+                            // Retry the API call
+                            continue;
+                        }
+                        else
+                        {
+                            retryCount++;
+                            // Handle unsuccessful status code
+                            log.LogWarning($"Unhandled error getting weather data from API. Status code: {httpex.StatusCode}");
+                            // Wait before retrying
+                            await Task.Delay(APIRetryPauseMSeconds);
+                            // Retry the API call
+                            continue;
+                        }
+                        // Handle other exceptions
+                        //log.LogWarning($"{httpex.StatusCode}");
+
+                    }
+                }
+
+            }
+            return null;
+        }
+
+        private static async Task SendWeatherDataToEventHub(List<WeatherData> weatherData, string WeatherType, DateTime startOfProcessing, ILogger log)
+        {
+            EventHubProducerClient eventHubProducerClient = null;
+            var eventHubName = "";
+            if (WeatherType == "historic")
+            {
+                var connectionString = Environment.GetEnvironmentVariable("EventHubURIHistoric");
+                eventHubName = Environment.GetEnvironmentVariable("EventHubNameHistoric");
+                eventHubProducerClient = new EventHubProducerClient(connectionString, eventHubName);
+            }
+            else if (WeatherType == "forecast")
+            {
+                var connectionString = Environment.GetEnvironmentVariable("EventHubURIForecast");
+                eventHubName = Environment.GetEnvironmentVariable("EventHubNameForecast");
+                eventHubProducerClient = new EventHubProducerClient(connectionString, eventHubName);
+            }
+            else
+            {
+                log.LogInformation($"This type of weather event hub is not available: {WeatherType}.  Only historic or forecast");
+            }
+            int EventHubBatchSize = int.Parse(Environment.GetEnvironmentVariable("EventHubBatchSize"));
+            //var eventHubProducerClient = new EventHubProducerClient(connectionString, eventHubName);
+
+            try
+            {
+                //var events = weatherData.Select(w => new EventData(Encoding.UTF8.GetBytes(w.Json))).ToList();
+                var events = weatherData.Select(w => new EventData(Encoding.UTF8.GetBytes(w.Json))
+                {
+                    Properties = { { "queryTime", startOfProcessing } }
+                }).ToList();
+
+                for (int i = 0; i < events.Count; i += EventHubBatchSize)
+                {
+                    var batch = events.Skip(i).Take(EventHubBatchSize);
+                    try
+                    {
+                        await eventHubProducerClient.SendAsync(batch);
+                    }
+                    catch (EventHubsException ex)
+                    {
+                        // Log the exception
+                        log.LogError(ex, "Error sending events to Event Hub.");
+                    }
+                }
+                log.LogInformation($"Sent {events.Count} {WeatherType} messages to the Event Hub {eventHubName}.");
+            }
+            finally
+            {
+                await eventHubProducerClient.CloseAsync();
+            }
+        }
+    }
+}
